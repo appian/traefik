@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -40,6 +41,12 @@ type clientWrapper struct {
 	factoriesIngress    map[string]kinformers.SharedInformerFactory
 	isNamespaceAll      bool
 	watchedNamespaces   []string
+
+	// mu protects watchedNamespaces and factory maps during dynamic namespace discovery.
+	mu                sync.RWMutex
+	namespaceSelector string
+	eventHandler      *k8s.ResourceEventHandler
+	stopCh            <-chan struct{}
 
 	ignoreIngressClasses bool
 }
@@ -128,6 +135,10 @@ func (c *clientWrapper) WatchAll(ctx context.Context, namespace, namespaceSelect
 	stopCh := ctx.Done()
 	eventCh := make(chan any, 1)
 	eventHandler := &k8s.ResourceEventHandler{Ev: eventCh}
+
+	c.stopCh = stopCh
+	c.eventHandler = eventHandler
+	c.namespaceSelector = namespaceSelector
 
 	c.ignoreIngressClasses = false
 	_, err := c.clientset.NetworkingV1().IngressClasses().List(ctx, metav1.ListOptions{Limit: 1})
@@ -238,6 +249,18 @@ func (c *clientWrapper) WatchAll(ctx context.Context, namespace, namespaceSelect
 		}
 	}
 
+	// When a namespace selector is configured, watch namespaces so that new
+	// namespaces matching the selector are discovered dynamically.
+	if namespaceSelector != "" {
+		_, err = c.clusterScopeFactory.Core().V1().Namespaces().Informer().AddEventHandler(&namespaceEventHandler{
+			client:   c,
+			selector: namespaceSelector,
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	c.clusterScopeFactory.Start(stopCh)
 
 	for t, ok := range c.clusterScopeFactory.WaitForCacheSync(stopCh) {
@@ -261,6 +284,9 @@ func (c *clientWrapper) ListIngressClasses() ([]*netv1.IngressClass, error) {
 func (c *clientWrapper) ListIngresses() []*netv1.Ingress {
 	var results []*netv1.Ingress
 
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
 	for ns, factory := range c.factoriesIngress {
 		// networking
 		listNew, err := factory.Networking().V1().Ingresses().Lister().List(labels.Everything())
@@ -281,7 +307,10 @@ func (c *clientWrapper) UpdateIngressStatus(src *netv1.Ingress, ingStatus []netv
 		return fmt.Errorf("failed to get ingress %s/%s: namespace is not within watched namespaces", src.Namespace, src.Name)
 	}
 
+	c.mu.RLock()
 	ing, err := c.factoriesIngress[c.lookupNamespace(src.Namespace)].Networking().V1().Ingresses().Lister().Ingresses(src.Namespace).Get(src.Name)
+	c.mu.RUnlock()
+
 	if err != nil {
 		return fmt.Errorf("failed to get ingress %s/%s: %w", src.Namespace, src.Name, err)
 	}
@@ -314,6 +343,9 @@ func (c *clientWrapper) GetService(namespace, name string) (*corev1.Service, err
 		return nil, fmt.Errorf("failed to get service %s/%s: namespace is not within watched namespaces", namespace, name)
 	}
 
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
 	return c.factoriesKube[c.lookupNamespace(namespace)].Core().V1().Services().Lister().Services(namespace).Get(name)
 }
 
@@ -322,6 +354,9 @@ func (c *clientWrapper) GetEndpointSlicesForService(namespace, serviceName strin
 	if !c.isWatchedNamespace(namespace) {
 		return nil, fmt.Errorf("failed to get endpointslices for service %s/%s: namespace is not within watched namespaces", namespace, serviceName)
 	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
 	return k8s.EndpointSlicesByServiceName(
 		c.factoriesKube[c.lookupNamespace(namespace)].Discovery().V1().EndpointSlices().Informer().GetIndexer(),
@@ -336,6 +371,9 @@ func (c *clientWrapper) GetConfigMap(namespace, name string) (*corev1.ConfigMap,
 		return nil, fmt.Errorf("failed to get configmap %s/%s: namespace is not within watched namespaces", namespace, name)
 	}
 
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
 	return c.factoriesConfigMap[c.lookupNamespace(namespace)].Core().V1().ConfigMaps().Lister().ConfigMaps(namespace).Get(name)
 }
 
@@ -344,6 +382,9 @@ func (c *clientWrapper) GetSecret(namespace, name string) (*corev1.Secret, error
 	if !c.isWatchedNamespace(namespace) {
 		return nil, fmt.Errorf("failed to get secret %s/%s: namespace is not within watched namespaces", namespace, name)
 	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
 	return c.factoriesSecret[c.lookupNamespace(namespace)].Core().V1().Secrets().Lister().Secrets(namespace).Get(name)
 }
@@ -368,6 +409,9 @@ func (c *clientWrapper) isWatchedNamespace(ns string) bool {
 		return true
 	}
 
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
 	return slices.Contains(c.watchedNamespaces, ns)
 }
 
@@ -389,6 +433,209 @@ func isLoadBalancerIngressEquals(aSlice, bSlice []netv1.IngressLoadBalancerIngre
 	}
 
 	return true
+}
+
+// namespaceEventHandler watches for namespace events and dynamically starts or
+// stops informers when namespaces matching the configured label selector are
+// created or deleted.
+type namespaceEventHandler struct {
+	client   *clientWrapper
+	selector string
+}
+
+func (h *namespaceEventHandler) OnAdd(obj any, _ bool) {
+	ns, ok := obj.(*corev1.Namespace)
+	if !ok {
+		return
+	}
+
+	if !h.matchesSelector(ns) {
+		return
+	}
+
+	if err := h.client.addNamespace(ns.Name); err != nil {
+		log.Error().Err(err).Str("namespace", ns.Name).Msg("Failed to start informers for new namespace")
+	}
+}
+
+func (h *namespaceEventHandler) OnUpdate(oldObj, newObj any) {
+	oldNs, ok := oldObj.(*corev1.Namespace)
+	if !ok {
+		return
+	}
+
+	newNs, ok := newObj.(*corev1.Namespace)
+	if !ok {
+		return
+	}
+
+	wasMatching := h.matchesSelector(oldNs)
+	nowMatching := h.matchesSelector(newNs)
+
+	switch {
+	case !wasMatching && nowMatching:
+		// Namespace started matching: add it.
+		if err := h.client.addNamespace(newNs.Name); err != nil {
+			log.Error().Err(err).Str("namespace", newNs.Name).Msg("Failed to start informers for namespace")
+		}
+	case wasMatching && !nowMatching:
+		// Namespace stopped matching: remove it.
+		h.client.removeNamespace(oldNs.Name)
+	}
+}
+
+func (h *namespaceEventHandler) OnDelete(obj any) {
+	ns, ok := obj.(*corev1.Namespace)
+	if !ok {
+		return
+	}
+
+	if !h.matchesSelector(ns) {
+		return
+	}
+
+	h.client.removeNamespace(ns.Name)
+}
+
+func (h *namespaceEventHandler) matchesSelector(ns *corev1.Namespace) bool {
+	sel, err := labels.Parse(h.selector)
+	if err != nil {
+		return false
+	}
+
+	return sel.Matches(labels.Set(ns.Labels))
+}
+
+// addNamespace dynamically creates and starts informers for a newly discovered namespace.
+func (c *clientWrapper) addNamespace(ns string) error {
+	c.mu.RLock()
+	alreadyWatched := slices.Contains(c.watchedNamespaces, ns)
+	c.mu.RUnlock()
+
+	if alreadyWatched {
+		return nil
+	}
+
+	notOwnedByHelm := func(opts *metav1.ListOptions) {
+		opts.LabelSelector = "owner!=helm"
+	}
+
+	factoryIngress := kinformers.NewSharedInformerFactoryWithOptions(c.clientset, resyncPeriod, kinformers.WithNamespace(ns))
+	_, err := factoryIngress.Networking().V1().Ingresses().Informer().AddEventHandler(c.eventHandler)
+	if err != nil {
+		return err
+	}
+
+	factoryKube := kinformers.NewSharedInformerFactoryWithOptions(c.clientset, resyncPeriod, kinformers.WithNamespace(ns))
+	_, err = factoryKube.Core().V1().Services().Informer().AddEventHandler(c.eventHandler)
+	if err != nil {
+		return err
+	}
+	endpointSliceInformer := factoryKube.Discovery().V1().EndpointSlices().Informer()
+	if err = endpointSliceInformer.AddIndexers(k8s.EndpointSliceByServiceNameIndexers); err != nil {
+		return err
+	}
+	_, err = endpointSliceInformer.AddEventHandler(c.eventHandler)
+	if err != nil {
+		return err
+	}
+
+	factorySecret := kinformers.NewSharedInformerFactoryWithOptions(c.clientset, resyncPeriod, kinformers.WithNamespace(ns), kinformers.WithTweakListOptions(notOwnedByHelm))
+	_, err = factorySecret.Core().V1().Secrets().Informer().AddEventHandler(c.eventHandler)
+	if err != nil {
+		return err
+	}
+
+	factoryConfigMap := kinformers.NewSharedInformerFactoryWithOptions(c.clientset, resyncPeriod, kinformers.WithNamespace(ns), kinformers.WithTweakListOptions(notOwnedByHelm))
+	_, err = factoryConfigMap.Core().V1().ConfigMaps().Informer().AddEventHandler(c.eventHandler)
+	if err != nil {
+		return err
+	}
+
+	factoryIngress.Start(c.stopCh)
+	factoryKube.Start(c.stopCh)
+	factorySecret.Start(c.stopCh)
+	factoryConfigMap.Start(c.stopCh)
+
+	factoryIngress.WaitForCacheSync(c.stopCh)
+	factoryKube.WaitForCacheSync(c.stopCh)
+	factorySecret.WaitForCacheSync(c.stopCh)
+	factoryConfigMap.WaitForCacheSync(c.stopCh)
+
+	c.mu.Lock()
+	// Double-check after acquiring write lock.
+	if slices.Contains(c.watchedNamespaces, ns) {
+		c.mu.Unlock()
+		factoryIngress.Shutdown()
+		factoryKube.Shutdown()
+		factorySecret.Shutdown()
+		factoryConfigMap.Shutdown()
+		return nil
+	}
+	c.factoriesIngress[ns] = factoryIngress
+	c.factoriesKube[ns] = factoryKube
+	c.factoriesSecret[ns] = factorySecret
+	c.factoriesConfigMap[ns] = factoryConfigMap
+	c.watchedNamespaces = append(c.watchedNamespaces, ns)
+	c.mu.Unlock()
+
+	log.Info().Str("namespace", ns).Msg("Started watching new namespace")
+
+	// Signal a config reload so that resources in the new namespace are picked up.
+	eventHandlerFunc(c.eventHandler.Ev, ns)
+
+	return nil
+}
+
+// removeNamespace stops informers for a namespace that no longer matches the selector.
+func (c *clientWrapper) removeNamespace(ns string) {
+	c.mu.Lock()
+	if !slices.Contains(c.watchedNamespaces, ns) {
+		c.mu.Unlock()
+		return
+	}
+
+	factoryIngress := c.factoriesIngress[ns]
+	factoryKube := c.factoriesKube[ns]
+	factorySecret := c.factoriesSecret[ns]
+	factoryConfigMap := c.factoriesConfigMap[ns]
+
+	delete(c.factoriesIngress, ns)
+	delete(c.factoriesKube, ns)
+	delete(c.factoriesSecret, ns)
+	delete(c.factoriesConfigMap, ns)
+
+	c.watchedNamespaces = slices.DeleteFunc(c.watchedNamespaces, func(s string) bool {
+		return s == ns
+	})
+	c.mu.Unlock()
+
+	// Shutdown factories outside the lock to avoid blocking readers.
+	if factoryIngress != nil {
+		factoryIngress.Shutdown()
+	}
+	if factoryKube != nil {
+		factoryKube.Shutdown()
+	}
+	if factorySecret != nil {
+		factorySecret.Shutdown()
+	}
+	if factoryConfigMap != nil {
+		factoryConfigMap.Shutdown()
+	}
+
+	log.Info().Str("namespace", ns).Msg("Stopped watching namespace")
+
+	// Signal a config reload so that routes for the removed namespace are cleaned up.
+	eventHandlerFunc(c.eventHandler.Ev, ns)
+}
+
+// eventHandlerFunc will pass the obj on to the events channel or drop it.
+func eventHandlerFunc(events chan<- any, obj any) {
+	select {
+	case events <- obj:
+	default:
+	}
 }
 
 // filterIngressClass return a slice containing IngressClass matching either the annotation name or the controller.
